@@ -125,7 +125,8 @@ def calculate_route(req: RouteRequest):
             u = route[i]
             v = route[i+1]
             
-            edge_data = active_graph.get_edge_data(u, v)[0]
+            edge_dict = active_graph.get_edge_data(u, v)
+            edge_data = min(edge_dict.values(), key=lambda x: x.get('length', float('inf')))
             street_name = edge_data.get('name', 'Unnamed Path')
             if isinstance(street_name, list): street_name = street_name[0]
             segment_length = edge_data.get('length', 0)
