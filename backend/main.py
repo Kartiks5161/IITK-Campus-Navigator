@@ -3,9 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import osmnx as ox
 import networkx as nx
-import itertools
 import warnings
 import math
+import traceback # Added for detailed error logs
 
 warnings.filterwarnings('ignore')
 
@@ -21,7 +21,6 @@ app.add_middleware(
 
 graphs = {}
 landmarks = {}
-# --- NEW: Dictionary to hold categorized amenities ---
 explore_data = {
     "food": {},     # Cafes, restaurants, food courts
     "money": {},    # ATMs, banks
@@ -64,7 +63,7 @@ def load_data():
             # Save to general landmarks for searching
             landmarks[name] = coords
             
-            # --- NEW: Categorize the data for the "Explore" buttons ---
+            # Categorize the data for the "Explore" buttons
             amenity_type = str(row.get('amenity', '')).lower()
             if amenity_type in ['cafe', 'restaurant', 'fast_food', 'food_court']:
                 explore_data["food"][name] = coords
@@ -88,7 +87,6 @@ class RouteRequest(BaseModel):
 def get_landmarks():
     return dict(sorted(landmarks.items()))
 
-# --- NEW API ENDPOINT FOR CATEGORIES ---
 @app.get("/api/explore/{category}")
 def explore_category(category: str):
     """Returns POIs for a specific category (food, money, health)."""
@@ -125,8 +123,12 @@ def calculate_route(req: RouteRequest):
             u = route[i]
             v = route[i+1]
             
+            # --- THE BUG FIX ---
+            # Instead of assuming the edge ID is 0, we dynamically pick the shortest edge
             edge_dict = active_graph.get_edge_data(u, v)
             edge_data = min(edge_dict.values(), key=lambda x: x.get('length', float('inf')))
+            # -------------------
+            
             street_name = edge_data.get('name', 'Unnamed Path')
             if isinstance(street_name, list): street_name = street_name[0]
             segment_length = edge_data.get('length', 0)
@@ -155,5 +157,9 @@ def calculate_route(req: RouteRequest):
             "id": 0, "distance_meters": round(distance_m, 1), 
             "time_minutes": round(time_min, 1), "path": path_coords, "steps": steps
         }]
+        
+    except nx.NetworkXNoPath:
+        raise HTTPException(status_code=404, detail=f"No {mode} route found. These points might be disconnected.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Calculation failed.")
+        traceback.print_exc() # Prints the exact line of failure to the server console
+        raise HTTPException(status_code=500, detail=f"System Error: {str(e)}")

@@ -4,7 +4,7 @@ import L from 'leaflet';
 import axios from 'axios';
 import { Navigation, RefreshCcw, Bike, Footprints, Car, Search, Clock, Ruler, X, LocateFixed, ListOrdered, ArrowRight, ArrowUp, CornerUpLeft, CornerUpRight, Coffee, Banknote, Stethoscope } from 'lucide-react';
 
-const API_BASE = "https://iitk-navigator-api.onrender.com";
+const API_BASE = "http://localhost:8000";
 
 // --- CUSTOM ICONS ---
 const createIcon = (color) => new L.Icon({
