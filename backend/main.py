@@ -163,3 +163,7 @@ def calculate_route(req: RouteRequest):
     except Exception as e:
         traceback.print_exc() # Prints the exact line of failure to the server console
         raise HTTPException(status_code=500, detail=f"System Error: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
