@@ -5,7 +5,9 @@ import osmnx as ox
 import networkx as nx
 import warnings
 import math
-import traceback # Added for detailed error logs
+import traceback
+from typing import List
+from datetime import datetime # NEW: For temporal routing
 
 warnings.filterwarnings('ignore')
 
@@ -22,10 +24,21 @@ app.add_middleware(
 graphs = {}
 landmarks = {}
 explore_data = {
-    "food": {},     # Cafes, restaurants, food courts
-    "money": {},    # ATMs, banks
-    "health": {}    # Clinics, pharmacies
+    "food": {},     
+    "money": {},    
+    "health": {}    
 }
+
+# --- NEW: ACADEMIC AREA GEOFENCE ---
+# Approximate GPS boundaries of the academic area (Lat/Lng)
+ACADEMIC_BBOX = {
+    "lat_min": 26.5080, "lat_max": 26.5160,
+    "lng_min": 80.2270, "lng_max": 80.2350
+}
+
+def is_in_academic_area(lat, lng):
+    return (ACADEMIC_BBOX["lat_min"] <= lat <= ACADEMIC_BBOX["lat_max"] and
+            ACADEMIC_BBOX["lng_min"] <= lng <= ACADEMIC_BBOX["lng_max"])
 
 def get_bearing(lat1, lon1, lat2, lon2):
     dLon = math.radians(lon2 - lon1)
@@ -51,7 +64,6 @@ def load_data():
         
         iitk_coords = (26.5123, 80.2329)
         tags = {'amenity': True, 'building': True, 'leisure': True, 'office': True}
-        
         pois = ox.features_from_point(iitk_coords, dist=1500, tags=tags)
         named_pois = pois.dropna(subset=['name'])
         
@@ -59,11 +71,8 @@ def load_data():
             centroid = row['geometry'].centroid 
             name = str(row['name'])
             coords = {"lat": centroid.y, "lng": centroid.x}
-            
-            # Save to general landmarks for searching
             landmarks[name] = coords
             
-            # Categorize the data for the "Explore" buttons
             amenity_type = str(row.get('amenity', '')).lower()
             if amenity_type in ['cafe', 'restaurant', 'fast_food', 'food_court']:
                 explore_data["food"][name] = coords
@@ -72,15 +81,16 @@ def load_data():
             elif amenity_type in ['clinic', 'hospital', 'pharmacy']:
                 explore_data["health"][name] = coords
                 
-        print("✅ Backend is ready to serve multi-modal routes and categories!")
+        print("✅ Backend is ready to serve multi-modal routes!")
     except Exception as e:
         print(f"❌ Error during startup: {e}")
 
+class LocationPoint(BaseModel):
+    lat: float
+    lng: float
+
 class RouteRequest(BaseModel):
-    start_lat: float
-    start_lng: float
-    end_lat: float
-    end_lng: float
+    stops: List[LocationPoint]
     mode: str = "walk"
 
 @app.get("/api/landmarks")
@@ -89,9 +99,7 @@ def get_landmarks():
 
 @app.get("/api/explore/{category}")
 def explore_category(category: str):
-    """Returns POIs for a specific category (food, money, health)."""
-    if category in explore_data:
-        return explore_data[category]
+    if category in explore_data: return explore_data[category]
     return {}
 
 @app.post("/api/route")
@@ -99,67 +107,105 @@ def calculate_route(req: RouteRequest):
     speeds = {"walk": 5.0, "cycle": 15.0, "drive": 25.0}
     mode = req.mode.lower()
     speed_kmh = speeds.get(mode, 5.0)
-    
     active_graph = graphs['drive'] if mode == 'drive' else graphs['walk']
     
-    try:
-        start_node = ox.nearest_nodes(active_graph, req.start_lng, req.start_lat)
-        end_node = ox.nearest_nodes(active_graph, req.end_lng, req.end_lat)
-        
-        if start_node == end_node: return []
+    if len(req.stops) < 2: return []
 
-        route = nx.shortest_path(active_graph, start_node, end_node, weight='length')
-        distance_m = nx.path_weight(active_graph, route, weight='length')
-        time_min = (distance_m / 1000) / speed_kmh * 60
-        path_coords = [[active_graph.nodes[n]['y'], active_graph.nodes[n]['x']] for n in route]
-        
-        steps = []
-        current_street = None
-        current_length = 0
-        last_bearing = None
-        current_instruction = ""
-        
-        for i in range(len(route) - 1):
-            u = route[i]
-            v = route[i+1]
+    total_distance_m = 0
+    total_time_min = 0
+    full_path_coords = []
+    all_steps = []
+    
+    # --- TEMPORAL CHECK: Is it between xx:50 and xx:05? ---
+    current_minute = datetime.now().minute
+    is_rush_hour = current_minute >= 50 or current_minute <= 5
+    route_affected_by_traffic = False
+
+    try:
+        for i in range(len(req.stops) - 1):
+            s1 = req.stops[i]
+            s2 = req.stops[i+1]
             
-            # --- THE BUG FIX ---
-            # Instead of assuming the edge ID is 0, we dynamically pick the shortest edge
-            edge_dict = active_graph.get_edge_data(u, v)
-            edge_data = min(edge_dict.values(), key=lambda x: x.get('length', float('inf')))
-            # -------------------
+            start_node = ox.nearest_nodes(active_graph, s1.lng, s1.lat)
+            end_node = ox.nearest_nodes(active_graph, s2.lng, s2.lat)
+            if start_node == end_node: continue
+
+            route = nx.shortest_path(active_graph, start_node, end_node, weight='length')
             
-            street_name = edge_data.get('name', 'Unnamed Path')
-            if isinstance(street_name, list): street_name = street_name[0]
-            segment_length = edge_data.get('length', 0)
+            # We now calculate distance and time segment by segment to apply the penalty
+            segment_distance_m = 0
+            segment_time_min = 0
             
-            lat1, lon1 = active_graph.nodes[u]['y'], active_graph.nodes[u]['x']
-            lat2, lon2 = active_graph.nodes[v]['y'], active_graph.nodes[v]['x']
-            current_bearing = get_bearing(lat1, lon1, lat2, lon2)
+            current_street = None
+            current_length = 0
+            last_bearing = None
+            current_instruction = ""
             
-            if street_name == current_street:
-                current_length += segment_length
-            else:
-                if current_street is not None:
-                    steps.append({"instruction": current_instruction, "distance": round(current_length)})
-                    turn = get_turn_direction(last_bearing, current_bearing)
-                    current_instruction = f"Continue onto {street_name}" if turn == "Continue straight" else f"{turn} onto {street_name}"
+            for j in range(len(route) - 1):
+                u = route[j]
+                v = route[j+1]
+                edge_dict = active_graph.get_edge_data(u, v)
+                edge_data = min(edge_dict.values(), key=lambda x: x.get('length', float('inf')))
+                
+                street_name = edge_data.get('name', 'Unnamed Path')
+                if isinstance(street_name, list): street_name = street_name[0]
+                edge_length = edge_data.get('length', 0)
+                
+                lat1, lon1 = active_graph.nodes[u]['y'], active_graph.nodes[u]['x']
+                lat2, lon2 = active_graph.nodes[v]['y'], active_graph.nodes[v]['x']
+                
+                # --- THE GEOFENCED TIME PENALTY ---
+                # Base time for this tiny piece of road
+                edge_time = (edge_length / 1000) / speed_kmh * 60 
+                
+                # If it's rush hour, user is walking/cycling, AND they are in the academic area:
+                if is_rush_hour and mode in ['walk', 'cycle'] and is_in_academic_area(lat1, lon1):
+                    edge_time *= 2.5 # Slower due to crowds!
+                    route_affected_by_traffic = True
+                # ----------------------------------
+                
+                segment_distance_m += edge_length
+                segment_time_min += edge_time
+                
+                current_bearing = get_bearing(lat1, lon1, lat2, lon2)
+                
+                if street_name == current_street: current_length += edge_length
                 else:
-                    current_instruction = f"Head along {street_name}"
-                current_street = street_name
-                current_length = segment_length
-            last_bearing = current_bearing 
+                    if current_street is not None:
+                        all_steps.append({"instruction": current_instruction, "distance": round(current_length)})
+                        turn = get_turn_direction(last_bearing, current_bearing)
+                        current_instruction = f"Continue onto {street_name}" if turn == "Continue straight" else f"{turn} onto {street_name}"
+                    else: current_instruction = f"Head along {street_name}"
+                    current_street = street_name
+                    current_length = edge_length
+                last_bearing = current_bearing 
+                
+            if current_street is not None:
+                 all_steps.append({"instruction": current_instruction, "distance": round(current_length)})
+                 
+            if i < len(req.stops) - 2:
+                 all_steps.append({"instruction": f"📍 Arrived at Waypoint {i+1}", "distance": 0})
             
-        if current_street is not None:
-             steps.append({"instruction": current_instruction, "distance": round(current_length)})
+            total_distance_m += segment_distance_m
+            total_time_min += segment_time_min
+            
+            path_coords = [[active_graph.nodes[n]['y'], active_graph.nodes[n]['x']] for n in route]
+            if i > 0 and len(path_coords) > 0: path_coords = path_coords[1:] 
+            full_path_coords.extend(path_coords)
+
+        if len(full_path_coords) == 0: return []
 
         return [{
-            "id": 0, "distance_meters": round(distance_m, 1), 
-            "time_minutes": round(time_min, 1), "path": path_coords, "steps": steps
+            "id": 0, 
+            "distance_meters": round(total_distance_m, 1), 
+            "time_minutes": round(total_time_min, 1), 
+            "path": full_path_coords, 
+            "steps": all_steps,
+            "has_traffic": route_affected_by_traffic # Tell the frontend!
         }]
         
     except nx.NetworkXNoPath:
-        raise HTTPException(status_code=404, detail=f"No {mode} route found. These points might be disconnected.")
+        raise HTTPException(status_code=404, detail=f"No {mode} route found between stops.")
     except Exception as e:
-        traceback.print_exc() # Prints the exact line of failure to the server console
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"System Error: {str(e)}")
